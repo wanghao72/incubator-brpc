@@ -15,6 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// 采集器，像window等和时间窗口相关的类型需要使用 sampler 来定时采集，每一个需要采集的 bvar 对应一个 sampler
+/**
+（1） Sample ：用于保存采样值的结构体。
+（2） SamplerCollector ：全局的用来遍历所有的Sampler并执行采样操作的结构。
+（3） Sampler ：采样器的基类
+（4） ReducerSampler ：继承自Sampler的用于对Reducer类型的bvar进行采样的采样器
+ */
+
 // Date: Tue Jul 28 18:14:40 CST 2015
 
 #include "butil/time.h"
@@ -30,6 +38,7 @@ namespace detail {
 const int WARN_NOSLEEP_THRESHOLD = 2;
 
 // Combine two circular linked list into one.
+// CombineSampler 运算符，做了一个合并，也就是把s1插到s2之前
 struct CombineSampler {
     void operator()(Sampler* & s1, Sampler* s2) const {
         if (s2 == NULL) {
@@ -58,6 +67,10 @@ static bool registered_atfork = false;
 // list of Samplers. Waking through the list and call take_sample().
 // If a Sampler needs to be deleted, we just mark it as unused and the
 // deletion is taken place in the thread as well.
+// 
+// 这个类是一个用来遍历所有的Sampler并执行采样操作的全局结构
+// 对于需要定期执行的操作，一种常见的做法是用定时器线程，但一旦sampler多了，效率上是不尽人意的，
+// 这里把 SamplerCollector 定义成模板参数为 Sampler 指针和一个特定运算符 CombineSampler 的Reducer
 class SamplerCollector : public bvar::Reducer<Sampler*, CombineSampler> {
 public:
     SamplerCollector()
@@ -127,8 +140,10 @@ static PassiveStatus<double>* s_cumulated_time_bvar = NULL;
 static bvar::PerSecond<bvar::PassiveStatus<double> >* s_sampling_thread_usage_bvar = NULL;
 #endif
 
+// 调用 pthread_create 启动线程执行 sampling_thread() ，实质上就是调用run()
 void SamplerCollector::run() {
 #ifndef UNIT_TEST
+    // PassiveStatus 类型的 cumulated_time 和使用它的 usage 则是用来监控执行时间的
     // NOTE:
     // * Following vars can't be created on thread's stack since this thread
     //   may be adandoned at any time after forking.
@@ -144,15 +159,24 @@ void SamplerCollector::run() {
                     "bvar_sampler_collector_usage", s_cumulated_time_bvar, 10);
     }
 #endif
-
+    // Root 是整个collector的根节点，也就是串联起来的sampler的起点
+    // consecutive_nosleep 是保存连续没有sleep的次数，设定是每隔一秒采集一次，如果一秒内都没有执行完所有的sampler这个值就会加1，表明延迟了。
     butil::LinkNode<Sampler> root;
     int consecutive_nosleep = 0;
+    // 只要_stop不为true就一直执行定时采集任务
     while (!_stop) {
         int64_t abstime = butil::gettimeofday_us();
+
+        // 首先是调用reset拿到一个sampler的指针s，SamplerCollector作为一个Reducer，reset实质上调用的是combiner的reset
+        // 根据CombineSampler运算符不难理解，就是把所有的Sampler串起来返回后并重置为NULL，随后将这些sampler指针插入到root节点后面，
+        // 简单来说就是每次采样前会将新增的sampler加到队列里。
         Sampler* s = this->reset();
         if (s) {
             s->InsertBeforeAsList(&root);
         }
+
+        // 随后则是遍历链表进行采样，需要注意的是会有加锁操作，因为需要和sampler其他的诸如destroy的函数互斥，
+        // 然后判断s->_used ，如果为false，说明已经执行了 destroy ，从链表移除并delete，否则采样后解锁
         int nremoved = 0;
         int nsampled = 0;
         for (butil::LinkNode<Sampler>* p = root.next(); p != &root;) {
@@ -172,6 +196,11 @@ void SamplerCollector::run() {
             }
             p = saved_next;
         }
+
+        // 一轮采样完成后则是耗时的计算和判断，简单来说就是以函数开头获取的时间为基准时间，纪录本轮耗时，
+        // 并判断是否超过1s，如果没超过，sleep掉剩余的部分，
+        // 如果超过了，consecutive_nosleep加1，表明本次出现了延迟，不会sleep而是直接进入了下一轮采集，
+        // 并且如果达到阈值会打warning日志，没超过则consecutive_nosleep清0
         bool slept = false;
         int64_t now = butil::gettimeofday_us();
         _cumulated_time_us += now - abstime;

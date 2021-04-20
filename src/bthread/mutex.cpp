@@ -613,8 +613,8 @@ BUTIL_FORCE_INLINE int pthread_mutex_unlock_impl(pthread_mutex_t* mutex) {
 
 // Implement bthread_mutex_t related functions
 struct MutexInternal {
-    butil::static_atomic<unsigned char> locked;
-    butil::static_atomic<unsigned char> contended;
+    butil::static_atomic<unsigned char> locked;      // 代表是否lock，1:lock、0:nonlock
+    butil::static_atomic<unsigned char> contended;   // 代表是否有竞争
     unsigned short padding;
 };
 
@@ -661,6 +661,7 @@ namespace internal {
 int FastPthreadMutex::lock_contended() {
     butil::atomic<unsigned>* whole = (butil::atomic<unsigned>*)&_futex;
     while (whole->exchange(BTHREAD_MUTEX_CONTENDED) & BTHREAD_MUTEX_LOCKED) {
+        // futex wait ，即陷入内核等待，将当前线程挂到 whole 对应的队列里（ whole 即 _futex 所指向的处于内核hash表中的任务队列）
         if (futex_wait_private(whole, BTHREAD_MUTEX_CONTENDED, NULL) < 0
             && errno != EWOULDBLOCK) {
             return errno;
@@ -670,10 +671,13 @@ int FastPthreadMutex::lock_contended() {
 }
 
 void FastPthreadMutex::lock() {
+    // 直接将 MutexInternal 原子类型成员 locked 的状态置为1（代表加锁）
+    // exchange(非阻塞的) 会返回之前 locked 封装的值，如果是1则执行 lock_contended （有竞争）
     bthread::MutexInternal* split = (bthread::MutexInternal*)&_futex;
     if (split->locked.exchange(1, butil::memory_order_acquire)) {
         (void)lock_contended();
     }
+    // 无竞争情况下直接返回   (locked -> 1)
 }
 
 bool FastPthreadMutex::try_lock() {
@@ -683,9 +687,10 @@ bool FastPthreadMutex::try_lock() {
 
 void FastPthreadMutex::unlock() {
     butil::atomic<unsigned>* whole = (butil::atomic<unsigned>*)&_futex;
-    const unsigned prev = whole->exchange(0, butil::memory_order_release);
+    const unsigned prev = whole->exchange(0, butil::memory_order_release);          // try change it to 0, return prev(nowadays value)
     // CAUTION: the mutex may be destroyed, check comments before butex_create
     if (prev != BTHREAD_MUTEX_LOCKED) {
+        // 唤醒其他处于futex_wait的pthread，都来自于whole队列（whole即_futex所指向的处于内核hash表中的任务队列）
         futex_wake_private(whole, 1);
     }
 }

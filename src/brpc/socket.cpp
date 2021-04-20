@@ -1014,6 +1014,8 @@ void Socket::OnRecycle() {
 void* Socket::ProcessEvent(void* arg) {
     // the enclosed Socket is valid and free to access inside this function.
     SocketUniquePtr s(static_cast<Socket*>(arg));
+    // 对于目前收到新连接请求的情况，事件发生在监听端口上，对应的_on_edge_triggered_events是 StartAccept 里赋值的 OnNewConnection 
+    // 也就是来了新连接要调用的回调函数
     s->_on_edge_triggered_events(s.get());
     return NULL;
 }
@@ -1918,6 +1920,16 @@ AuthContext* Socket::mutable_auth_context() {
     return _auth_context;
 }
 
+/*
+因为一个fd上会不断地发生事件，socket类里面设置了一个butil::atomic _nevent变量，用来保证对于一个fd，同时只会有一个bthread在处理，
+当收到事件时，EDISP给nevent加1，只有当加1前的值是0时启动一个bthread处理对应fd上的数据，前值不为0说明已经有bthread在处理该fd上的数据了，可以直接返回，
+因为正在处理的bthread会一直读下去。
+
+总的来说StartInputEvent仅仅是负责判断发生事件的fd上有没有bthread在处理了，没有就原地启动一个，有就直接返回，
+注意调用的是bthread_start_urgent，这个函数启动bthread会让出当前bthread，
+也就是官方文档所说的，“EDISP把所在的pthread让给了新建的bthread，使其有更好的cache locality，可以尽快地读取fd上的数据”，不需要pthread切换对性能有帮助。
+
+ */
 int Socket::StartInputEvent(SocketId id, uint32_t events,
                             const bthread_attr_t& thread_attr) {
     SocketUniquePtr s;

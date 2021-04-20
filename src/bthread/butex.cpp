@@ -117,8 +117,8 @@ struct BAIDU_CACHELINE_ALIGNMENT Butex {
     ~Butex() {}
 
     butil::atomic<int> value;
-    ButexWaiterList waiters;
-    internal::FastPthreadMutex waiter_lock;
+    ButexWaiterList waiters;                    // waiting list
+    internal::FastPthreadMutex waiter_lock;     // FastPthreadMutex in mutex.h or pthread mutex
 };
 
 BAIDU_CASSERT(offsetof(Butex, value) == 0, offsetof_value_must_0);
@@ -189,14 +189,14 @@ inline int unsleep_if_necessary(ButexBthreadWaiter* w,
 //   public:
 //     void wait() {
 //       _mutex.lock();
-//       if (!_done) {
+//       if (!_done) {          // wait for true
 //         _cond.wait(&_mutex);
 //       }
 //       _mutex.unlock();
 //     }
 //     void signal() {
 //       _mutex.lock();
-//       if (!_done) {
+//       if (!_done) {          // false -> true
 //         _done = true;
 //         _cond.signal();
 //       }

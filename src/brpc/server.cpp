@@ -966,6 +966,7 @@ int Server::StartInternal(const butil::ip_t& ip,
                 return -1;
             }
         }
+        // _am :  class Acceptor : public InputMessenger 
         if (_am == NULL) {
             _am = BuildAcceptor();
             if (NULL == _am) {

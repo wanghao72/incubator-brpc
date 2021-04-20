@@ -57,6 +57,10 @@ inline T* get_leaky_singleton() {
     if (value) {
         return reinterpret_cast<T*>(value);
     }
+    /*
+    int pthread_once(pthread_once_t *once_control, void (*init_routine) (void))；
+功能：本函数使用初值为 PTHREAD_ONCE_INIT 的 once_control 变量保证 init_routine() 函数在本进程执行序列中仅执行一次。
+     */
     pthread_once(&GetLeakySingleton<T>::g_create_leaky_singleton_once,
                  GetLeakySingleton<T>::create_leaky_singleton);
     return reinterpret_cast<T*>(

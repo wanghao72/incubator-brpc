@@ -64,6 +64,10 @@ namespace bvar {
 // bvar::Adder<MyType> my_type_sum;
 // my_type_sum << MyType(1) << MyType(2) << MyType(3);
 // LOG(INFO) << my_type_sum;  // "MyType{6}"
+/**
+ * Variable中主要是曝光相关的
+ * Reducer是一个三个模板参数的模板类，分别是数据类型 T ；reduce操作符 Op ；Op的逆向操作符 InvOp ，默认是VoidOp，也就是没有逆向操作符, InvOp 在定时采样的时候会用到。
+ */
 
 template <typename T, typename Op, typename InvOp = detail::VoidOp>
 class Reducer : public Variable {
@@ -89,7 +93,7 @@ public:
             const Op& op = Op(),
             const InvOp& inv_op = InvOp())
         : _combiner(identity, identity, op)
-        , _sampler(NULL)
+        , _sampler(NULL)         // 只有被window之类的追踪了才会去新建 sampler ，单纯的使用reducer不需要 sampler
         , _series_sampler(NULL)
         , _inv_op(inv_op) {
     }
@@ -114,6 +118,10 @@ public:
     // Get reduced value.
     // Notice that this function walks through threads that ever add values
     // into this reducer. You should avoid calling it frequently.
+    // 
+    // 通过combiner聚合各个agent的值，不过要注意上面的check，这个check是说如果当前bvar已被window跟踪定时采样而且不存在invop，
+    // 比如Maxer，是不能调用这个函数的，因为依赖tls的关系，对于这类没有invop的reducer，在定时采样（take_sample）的时候需要reset agent，
+    // 调用这个函数取不到正确值。
     T get_value() const {
         CHECK(!(butil::is_same<InvOp, detail::VoidOp>::value) || _sampler == NULL)
             << "You should not call Reducer<" << butil::class_name_str<T>()
@@ -181,8 +189,13 @@ protected:
     }
 
 private:
+    /*
+    typedef typename detail::AgentCombiner<T, T, Op> combiner_type;
+    typedef typename combiner_type::Agent agent_type;
+    typedef detail::ReducerSampler<Reducer, T, Op, InvOp> sampler_type;
+     */
     combiner_type   _combiner;
-    sampler_type* _sampler;
+    sampler_type* _sampler;             // 两种sampler因为不是必须的，所以是指针
     SeriesSampler* _series_sampler;
     InvOp _inv_op;
 };
@@ -191,6 +204,8 @@ template <typename T, typename Op, typename InvOp>
 inline Reducer<T, Op, InvOp>& Reducer<T, Op, InvOp>::operator<<(
     typename butil::add_cr_non_integral<T>::type value) {
     // It's wait-free for most time
+    // 首先是调用combiner的get_or_create_tls_agent函数拿到当前线程的agent，内部实现上就是tls的相关操作，
+    // 如果还未分配则会新建agent，得到agent之后用操作符和值进行修改操作
     agent_type* agent = _combiner.get_or_create_tls_agent();
     if (__builtin_expect(!agent, 0)) {
         LOG(FATAL) << "Fail to create agent";
@@ -223,10 +238,12 @@ struct MinusFrom {
 template <typename T>
 class Adder : public Reducer<T, detail::AddTo<T>, detail::MinusFrom<T> > {
 public:
+    // AddTo -> OP,  MinusFrom -> Invop
     typedef Reducer<T, detail::AddTo<T>, detail::MinusFrom<T> > Base;
     typedef T value_type;
     typedef typename Base::sampler_type sampler_type;
 public:
+    // 三个构造函数分别对应不全局曝光、不指定前缀曝光指定和前缀曝光的场景
     Adder() : Base() {}
     explicit Adder(const butil::StringPiece& name) : Base() {
         this->expose(name);

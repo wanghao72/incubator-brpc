@@ -96,6 +96,9 @@ struct SeriesOptions {
 //     variables, const methods are thread-safe, namely you can call
 //     describe()/get_description()/get_value() etc from diferent threads
 //     safely (provided that there's no non-const methods going on).
+//     
+//用户以默认参数建立一个bvar时，这个bvar并未注册到任何全局结构中，在这种情况下，bvar纯粹是一个更快的计数器。
+//我们称把一个bvar注册到全局表中的行为为”曝光“，可通过 expose 函数曝光
 class Variable {
 public:
     Variable() {}
