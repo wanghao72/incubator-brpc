@@ -266,19 +266,26 @@ int butex_wake(void* arg) {
     ButexWaiter* front = NULL;
     {
         BAIDU_SCOPED_LOCK(b->waiter_lock);
-        if (b->waiters.empty()) {
+        if (b->waiters.empty()) {   // 如果没有等待的thread，则无需进行wake，直接返回
             return 0;
         }
+        // 取出 waiters 队列中的第一个thread，从 waiters 链表中摘除
         front = b->waiters.head()->value();
         front->RemoveFromList();
         front->container.store(NULL, butil::memory_order_relaxed);
     }
+    // 检查bthread_id，如果=0则说明是pthread模式，直接去wake pthread，这里调用了futex_wake
     if (front->tid == 0) {
         wakeup_pthread(static_cast<ButexPthreadWaiter*>(front));
         return 1;
     }
+    // 执行一个bthread_waiter的wake，这里的ButexBthreadWaiter和ButexPthreadWaiter是ButexWaiter的不同实现，区分两种thread，其结构和用法后面再介绍
     ButexBthreadWaiter* bbw = static_cast<ButexBthreadWaiter*>(front);
     unsleep_if_necessary(bbw, get_global_timer_thread());
+    // task_group的数据结构后面会详细介绍
+    // 这里通过对tls_task_group（安全性检查）的判断，来检验当前pthread是不是一个可以执行唤醒后的bthread的worker
+    // 如果是，则直接wake去执行
+    // 如果不是，则随机选一个task_group加到其remote队列中
     TaskGroup* g = tls_task_group;
     if (g) {
         TaskGroup::exchange(&g, bbw->tid);
@@ -616,10 +623,13 @@ int butex_wait(void* arg, int expected_value, const timespec* abstime) {
         butil::atomic_thread_fence(butil::memory_order_acquire);
         return -1;
     }
+    // 同样通过对tls_task_group的检查来区分bthread和pthread执行
+    // is_current_pthread_task=true 表示这是一个 pthread ， butex_wait_from_pthread 最后还是通过 futex_wait 来使其等待
     TaskGroup* g = tls_task_group;
     if (NULL == g || g->is_current_pthread_task()) {
         return butex_wait_from_pthread(g, b, expected_value, abstime);
     }
+    // 这里涉及到另外两个bthread的核心数据结构 task_meta 和 task_contorl
     ButexBthreadWaiter bbw;
     // tid is 0 iff the thread is non-bthread
     bbw.tid = g->current_tid();

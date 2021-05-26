@@ -55,6 +55,7 @@ void run_worker_startfn() {
     }
 }
 
+// 每一个pthread_worker的启动函数
 void* TaskControl::worker_thread(void* arg) {
     run_worker_startfn();    
 #ifdef BAIDU_INTERNAL
@@ -62,6 +63,7 @@ void* TaskControl::worker_thread(void* arg) {
 #endif
     
     TaskControl* c = static_cast<TaskControl*>(arg);
+    // 重要步骤1：创建一个task_group
     TaskGroup* g = c->create_group();
     TaskStatistics stat;
     if (NULL == g) {
@@ -71,14 +73,19 @@ void* TaskControl::worker_thread(void* arg) {
     BT_VLOG << "Created worker=" << pthread_self()
             << " bthread=" << g->main_tid();
 
+    // 重要变量，定义 BAIDU_THREAD_LOCAL TaskGroup* tls_task_group;
+    // tls_task_group 是一个 thread_local 变量，且只有由 task_control 启动的worker线程所拥有的 task_group tls_task_group 非null
     tls_task_group = g;
     c->_nworkers << 1;
+
+    // 重要步骤2:运行main_task，即从队列中获取到的一个bthread
     g->run_main_task();
 
     stat = g->main_stat();
     BT_VLOG << "Destroying worker=" << pthread_self() << " bthread="
             << g->main_tid() << " idle=" << stat.cputime_ns / 1000000.0
             << "ms uptime=" << g->current_uptime_ns() / 1000000.0 << "ms";
+    // 销毁
     tls_task_group = NULL;
     g->destroy_self();
     c->_nworkers << -1;
@@ -86,16 +93,19 @@ void* TaskControl::worker_thread(void* arg) {
 }
 
 TaskGroup* TaskControl::create_group() {
+    // 直接在堆上构造一个TaskGroup，由于task_group必属于一个task_control，所以构造函数中指明是当前调用这个函数的task_control
     TaskGroup* g = new (std::nothrow) TaskGroup(this);
     if (NULL == g) {
         LOG(FATAL) << "Fail to new TaskGroup";
         return NULL;
     }
+    // gflags 定义： DEFINE_int32(task_group_runqueue_capacity, 4096, "capacity of runqueue in each TaskGroup");
     if (g->init(FLAGS_task_group_runqueue_capacity) != 0) {
         LOG(ERROR) << "Fail to init TaskGroup";
         delete g;
         return NULL;
     }
+    // 写入_ngroup中
     if (_add_group(g) != 0) {
         delete g;
         return NULL;
@@ -143,6 +153,7 @@ TaskControl::TaskControl()
     CHECK(_groups) << "Fail to create array of groups";
 }
 
+// task_control初始化
 int TaskControl::init(int concurrency) {
     if (_concurrency != 0) {
         LOG(ERROR) << "Already initialized";
@@ -160,7 +171,10 @@ int TaskControl::init(int concurrency) {
         return -1;
     }
     
+    // 管理worker数，类型是 std::vector<pthread_t>
     _workers.resize(_concurrency);   
+
+    // 起concurrency个worker，运行work_thread函数
     for (int i = 0; i < _concurrency; ++i) {
         const int rc = pthread_create(&_workers[i], NULL, worker_thread, this);
         if (rc) {

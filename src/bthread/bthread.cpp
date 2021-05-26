@@ -173,12 +173,32 @@ int bthread_start_urgent(bthread_t* __restrict tid,
                          const bthread_attr_t* __restrict attr,
                          void * (*fn)(void*),
                          void* __restrict arg) {
+
+    // 在启动bthread的函数里，首先就会判断taskgroup是否为null：
+    // 如果不为null，则表明当前就是bthread而且taskgroup指明了对应的taskgroup，在对应taskgroup（worker）执行新bthread的启动即可。
+    // 会由 TaskGroup::start_foreground 调用开始
+    // 最后执行到sched_to（分配栈）→ sched_to+task_runner（meta版本，裁决是否jump stack、之后执行任务）→ wait/ending_sched 
+
     bthread::TaskGroup* g = bthread::tls_task_group;
     if (g) {
         // start from worker
         return bthread::TaskGroup::start_foreground(&g, tid, attr, fn, arg);
     }
+    // 如果taskgroup是为null，则说明调用 bthread_start_xxx 的线程不是bthread，这个时候会去调用 start_from_non_worker 函数，
+    // 该函数里会首先检查是否已经有 task_control 单例了，如果有说明其他地方已经建立过bthread了，也就已经启动了一定数量的 taskgroup
+    // 如果没有说明是首次启动bthread，需要创建，new taskcontrol后会执行 taskcontrol 的 init ，核心就是用pthread启动指定数量的worker。
+    // 即 循环调用worker_thread → 创建task_group置为tls_task_group → run_main_task（主入口）→ wait_task → sched_to+task_runner → wait/ending_sched
     return bthread::start_from_non_worker(tid, attr, fn, arg);
+
+    /**
+     * 一个bthread在自己的任务函数执行过程中想要挂起时，调用TaskGroup::yield(TaskGroup** pg)，yield()内部会调用TaskGroup::sched(TaskGroup** pg)，
+     * sched()也是负责将pthread的执行流转入下一个bthread（普通bthread或调度bthread）的任务函数。挂起的bthread在适当的时候会被其他bthread唤醒，
+     * 即某个bthread会负责将挂起的bthread的tid重新加入TaskGroup的任务队列
+     * 
+     * 一个bthread 1在自己的任务函数执行过程中需要创建新的bthread 2时，会调用TaskGroup::start_foreground()，
+     * 在start_foreground()内完成bthread 2的TaskMeta对象的创建，并调用sched_to()让pthread去执行bthread 2的任务函数。
+     * pthread在真正执行bthread 2的任务函数前会将bthread 1的tid重新压入TaskGroup的任务队列，bthread 1不久之后会再次被调度执行
+     */
 }
 
 int bthread_start_background(bthread_t* __restrict tid,
@@ -188,6 +208,7 @@ int bthread_start_background(bthread_t* __restrict tid,
     bthread::TaskGroup* g = bthread::tls_task_group;
     if (g) {
         // start from worker
+        // start_background 会把 "中断当前bthread" 改为 "push_rq"，等待调度
         return g->start_background<false>(tid, attr, fn, arg);
     }
     return bthread::start_from_non_worker(tid, attr, fn, arg);

@@ -149,7 +149,23 @@ void TaskGroup::run_main_task() {
 
     TaskGroup* dummy = this;
     bthread_t tid;
+    // wait一个bthread，这里调度顺序考虑了两种情况，是否存放bthread到parking lot中，parking_lot是介于control和group之间的的，数量多于control但少于group
+    // !!! 当某个worker idle的时候，就wait在对应的ParkingLot上，其他worker有任务入队的时候，会唤醒一个ParkingLot上的waiter。之所以设置4个ParkingLot是为了避免一次入队唤醒多个等待的worker（底层就是futex wait）!!!
+    //  ??? if force_bthread_nosignal can refuse switch bthread to other pthread after butex ???
+    // 首先整个函数内容是一个死循环，也就是我们常说的spinlock，因为futex机制的特性，通常都是结合spinlock来使用，循环体里面，
+    //  会根据 BTHREAD_DONT_SAVE_PARKING_STATE 宏定义是否存在来确定执行的代码，如果没有定义 BTHREAD_DONT_SAVE_PARKING_STATE ，说明要保存pl状态，
+    //  则会根据上一次的steal_task里保存的状态来判断
+    // 之后判断_pl是否处于停止状态，如果是，则直接返回-1，pl被调用stop()后会进入停止状态，正常运行过程中stop不会被调用。
+    //  尝试steal_task，如果取到了task则返回true，没取到则根据上次的状态进行wait，因为是在循环里，根据futex的机制，如果上一个state和当前_pl上的state一致，那么说明_pl上的任务没变化，继续steal没有意义，则wait;
+    //  否则说明有其他地方调用_pl上的signal，也就是有新的任务加到某个队列里，_pending_signal也会发生变化，steal有可能成功。如果进入了wait，在_pl的signal被调用的时候也会被唤醒
+    // steal主要顺序：
+    // 1、task_group::steal_task ，顺序是 自己的remote rq（第一个bthread是用户在用户线程上提交而非worker） -> 其他的task_group的rq -> 其他的task_group的remote rq
+    // 2、task_control::steal_task ，顺序是 自己的rq -> 自己的remote rq -> 其他的task_group的rq -> 其他的task_group的remote rq
     while (wait_task(&tid)) {
+        // 获取到一个可执行的bthread，sched_to去运行
+        // 
+        // 根据将要执行的bthread的tid在O(1)时间内定位到bthread的TaskMeta对象的地址
+        // 并确保bthread的私有栈空间已创建、context结构已分配，进而调用 TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta)
         TaskGroup::sched_to(&dummy, tid);
         DCHECK_EQ(this, dummy);
         DCHECK_EQ(_cur_meta->stack, _main_stack);
@@ -209,20 +225,27 @@ TaskGroup::~TaskGroup() {
     }
 }
 
+// task_group 初始化
 int TaskGroup::init(size_t runqueue_capacity) {
+    // run queue是一个workstealing队列，所以这里的容量是2的幂
     if (_rq.init(runqueue_capacity) != 0) {
         LOG(FATAL) << "Fail to init _rq";
         return -1;
     }
+
+    // remote_rq是一个有界有锁的ring buffer
     if (_remote_rq.init(runqueue_capacity / 2) != 0) {
         LOG(FATAL) << "Fail to init _remote_rq";
         return -1;
     }
+    // bthread栈
+    // 需要标识worker所以以一种类似空栈的方式存在，_main_stack就是这种类型的，这种stack也不用于切换，只是用来做一些判断
     ContextualStack* stk = get_stack(STACK_TYPE_MAIN, NULL);
     if (NULL == stk) {
         LOG(FATAL) << "Fail to get main stack container";
         return -1;
     }
+    // task_meta存放了task的元信息，包括函数原型、参数等等
     butil::ResourceId<TaskMeta> slot;
     TaskMeta* m = butil::get_resource<TaskMeta>(&slot);
     if (NULL == m) {
@@ -292,12 +315,13 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
         // libraries.
         void* thread_return;
         try {
+            // 执行meta函数
             thread_return = m->fn(m->arg);
         } catch (ExitException& e) {
             thread_return = e.value();
         }
 
-        // Group is probably changed
+        // Group is probably changed, bthread 执行中可能会被调度到其他pthread worker，即task_group会被改变
         g = tls_task_group;
 
         // TODO: Save thread_return
@@ -410,6 +434,9 @@ int TaskGroup::start_foreground(TaskGroup** pg,
     return 0;
 }
 
+// 立即启动或者加入rq等待调度
+// 立即启动时，会中断当前bthread的执行，因此通过 remain 将当前bthread重新push到rq中等待执行
+// 等待调度则会将 bthread push_rq ，不中断当前的操作
 template <bool REMOTE>
 int TaskGroup::start_background(bthread_t* __restrict th,
                                 const bthread_attr_t* __restrict attr,
@@ -504,6 +531,10 @@ TaskStatistics TaskGroup::main_stat() const {
     return m ? m->stat : EMPTY_STAT;
 }
 
+// 尝试从本地TaskGroup的任务队列中找出下一个bthread，或者从其他pthread的TaskGroup上steal一个bthread，如果没有bthread可用则下一个被执行的就是pthread的“调度bthread”
+// 1、从当前group的rq中pop或者steal，成功则会返回
+// 2、steal一个（自身remote rq，其他group的rq或者remote rq）
+// 之后会调用sched_to
 void TaskGroup::ending_sched(TaskGroup** pg) {
     TaskGroup* g = *pg;
     bthread_t next_tid = 0;
@@ -600,6 +631,11 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
 
         if (cur_meta->stack != NULL) {
             if (next_meta->stack != cur_meta->stack) {
+                // cur_meta此时为main_tid对应的taskmeta，next_meta为即将要执行的meta；
+                // 由前面文章可知bthread_jump_fcontext执行时，会将当前各个寄存器push到当前栈中，即pthread栈，
+                // 然后将esp赋值给(rdi)，即from->context，因此main_tid的stack便指向了pthread栈
+                // 这里真正执行bthread的切换。将执行pthread的cpu的寄存器的当前状态存入cur_meta的context中，
+                // 并将next_meta的context中的数据加载到cpu的寄存器中，开始执行next_meta的任务函数
                 jump_stack(cur_meta->stack, next_meta->stack);
                 // probably went to another group, need to assign g again.
                 g = tls_task_group;

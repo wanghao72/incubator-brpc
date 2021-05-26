@@ -689,7 +689,7 @@ void FastPthreadMutex::unlock() {
     butil::atomic<unsigned>* whole = (butil::atomic<unsigned>*)&_futex;
     const unsigned prev = whole->exchange(0, butil::memory_order_release);          // try change it to 0, return prev(nowadays value)
     // CAUTION: the mutex may be destroyed, check comments before butex_create
-    if (prev != BTHREAD_MUTEX_LOCKED) {
+    if (prev != BTHREAD_MUTEX_LOCKED) {                         // prev == MUTEX_CONTENDED_RAW -> have contend -> wake contender
         // 唤醒其他处于futex_wait的pthread，都来自于whole队列（whole即_futex所指向的处于内核hash表中的任务队列）
         futex_wake_private(whole, 1);
     }
